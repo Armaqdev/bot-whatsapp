@@ -1,13 +1,14 @@
 const fs = require('fs');
 const path = require('path');
 const xlsx = require('xlsx');
-const { PDFParse } = require('pdf-parse');
+// FIX: pdf-parse NO tiene export nombrado, se importa directamente
+const pdfParse = require('pdf-parse');
 const { createWorker } = require('tesseract.js');
 
-const DEFAULT_PRICE_LIST_DIR = 'C:/Users/venta/Desktop/documentos laptop/lista de precios junio 2025';
-const PRICE_LIST_DIR = process.env.PRICE_LIST_DIR || DEFAULT_PRICE_LIST_DIR;
-const DEFAULT_PROMO_DIR = 'C:/Users/venta/Desktop/promo marzo';
-const PROMO_DIR = process.env.PROMO_DIR || DEFAULT_PROMO_DIR;
+const DEFAULT_PRICE_LIST_DIR = process.env.PRICE_LIST_DIR || 'C:/Users/venta/Desktop/documentos laptop/lista de precios junio 2025';
+const PRICE_LIST_DIR = DEFAULT_PRICE_LIST_DIR;
+const DEFAULT_PROMO_DIR = process.env.PROMO_DIR || 'C:/Users/venta/Desktop/promo marzo';
+const PROMO_DIR = DEFAULT_PROMO_DIR;
 const ALLOW_PROMO_PRICES = false;
 const REFRESH_MS = 10 * 60 * 1000;
 
@@ -46,7 +47,27 @@ let promoCache = {
     loadedFiles: 0
 };
 
+// FIX: worker con cleanup correcto
 let ocrWorker = null;
+
+async function getOcrWorker() {
+    if (!ocrWorker) {
+        ocrWorker = await createWorker('spa+eng');
+    }
+    return ocrWorker;
+}
+
+async function terminateOcrWorker() {
+    if (ocrWorker) {
+        await ocrWorker.terminate();
+        ocrWorker = null;
+    }
+}
+
+// Terminar worker al cerrar el proceso para evitar fuga de memoria
+process.on('exit', () => { if (ocrWorker) ocrWorker.terminate(); });
+process.on('SIGINT', async () => { await terminateOcrWorker(); process.exit(0); });
+process.on('SIGTERM', async () => { await terminateOcrWorker(); process.exit(0); });
 
 function normalizeText(value) {
     return String(value || '')
@@ -135,24 +156,16 @@ function processTextIntoMap(text, filePath, productMap) {
     }
 }
 
+// FIX: uso correcto de pdfParse (función directa, no clase)
 async function extractTextFromPdf(filePath) {
     const fileBuffer = fs.readFileSync(filePath);
-    const parser = new PDFParse({ data: fileBuffer });
-
-    try {
-        const result = await parser.getText();
-        return result.text || '';
-    } finally {
-        await parser.destroy();
-    }
+    const result = await pdfParse(fileBuffer);
+    return result.text || '';
 }
 
 async function extractTextFromImage(filePath) {
-    if (!ocrWorker) {
-        ocrWorker = await createWorker('spa+eng');
-    }
-
-    const result = await ocrWorker.recognize(filePath);
+    const worker = await getOcrWorker();
+    const result = await worker.recognize(filePath);
     return result?.data?.text || '';
 }
 
@@ -239,6 +252,10 @@ async function loadCatalog() {
                 text = await extractTextFromPdf(filePath);
             } else if (extension === '.xlsx' || extension === '.xls') {
                 text = extractTextFromXlsx(filePath);
+            } else if (extension === '.txt' || extension === '.csv') {
+                text = fs.readFileSync(filePath, 'utf8');
+            } else if (extension === '.jpg' || extension === '.jpeg' || extension === '.png') {
+                text = await extractTextFromImage(filePath);
             }
 
             if (text) {
@@ -403,49 +420,21 @@ async function loadPromotions() {
 }
 
 function formatBrandName(brand) {
-    if (brand === 'hypermaq') {
-        return 'Hypermaq';
-    }
-    if (brand === 'honda') {
-        return 'Honda';
-    }
-    if (brand === 'cipsa') {
-        return 'Cipsa';
-    }
-    if (brand === 'fidecsa') {
-        return 'Fidecsa';
-    }
-    if (brand === 'mpower') {
-        return 'Mpower';
-    }
-    if (brand === 'mopycsa') {
-        return 'Mopycsa';
-    }
-    return brand.charAt(0).toUpperCase() + brand.slice(1);
+    const names = { hypermaq: 'Hypermaq', honda: 'Honda', cipsa: 'Cipsa', fidecsa: 'Fidecsa', mpower: 'Mpower', mopycsa: 'Mopycsa' };
+    return names[brand] || brand.charAt(0).toUpperCase() + brand.slice(1);
 }
 
 function formatBrandList(brands) {
-    if (brands.length === 0) {
-        return '';
-    }
-
+    if (brands.length === 0) return '';
     const formatted = brands.map(formatBrandName);
-    if (formatted.length === 1) {
-        return formatted[0];
-    }
-
-    if (formatted.length === 2) {
-        return `${formatted[0]} y ${formatted[1]}`;
-    }
-
+    if (formatted.length === 1) return formatted[0];
+    if (formatted.length === 2) return `${formatted[0]} y ${formatted[1]}`;
     return `${formatted.slice(0, -1).join(', ')} y ${formatted[formatted.length - 1]}`;
 }
 
 async function getCatalogContext(userText) {
     const requestedProduct = detectProductInText(userText);
-    if (!requestedProduct) {
-        return null;
-    }
+    if (!requestedProduct) return null;
 
     const catalog = await loadCatalog();
     const productInfo = catalog.byProduct[requestedProduct];
@@ -459,9 +448,7 @@ async function getCatalogContext(userText) {
 
 async function getCatalogReply(userText) {
     const requestedProduct = detectProductInText(userText);
-    if (!requestedProduct) {
-        return null;
-    }
+    if (!requestedProduct) return null;
 
     const catalog = await loadCatalog();
     const productInfo = catalog.byProduct[requestedProduct];
@@ -476,9 +463,7 @@ async function getCatalogReply(userText) {
 
 async function getPromotionContext(userText) {
     const requestedProduct = detectProductInText(userText);
-    if (!requestedProduct || !isPromotionQuery(userText)) {
-        return null;
-    }
+    if (!requestedProduct || !isPromotionQuery(userText)) return null;
 
     return `Promocion detectada para ${requestedProduct}. Confirma disponibilidad y evita mencionar precios.`;
 }
@@ -486,9 +471,7 @@ async function getPromotionContext(userText) {
 async function getPromotionReply(userText) {
     const requestedProduct = detectProductInText(userText);
     const wantsPromo = isPromotionQuery(userText);
-    if (!wantsPromo) {
-        return null;
-    }
+    if (!wantsPromo) return null;
 
     if (!requestedProduct) {
         return 'Si tenemos promociones vigentes este mes. Dime que equipo te interesa y te confirmo si lo manejamos en venta.';
@@ -509,5 +492,6 @@ module.exports = {
     getCatalogContext,
     getCatalogReply,
     loadCatalog,
-    loadPromotions
+    loadPromotions,
+    terminateOcrWorker
 };

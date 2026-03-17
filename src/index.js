@@ -671,7 +671,7 @@ async function handleOwnerMessage(targetClient, message, incomingText, ownerPhon
         } catch (e) {}
         await targetClient.sendMessage(mediaChatId, media, { caption });
         await saveConversationMessage(pendingWithMedia.clientPhone, 'assistant', caption, 'quote:formal-owner');
-        await saveConversationMessage(ownerPhoneNumber, 'user', incomingText, 'owner');
+        await saveConversationMessage(OWNER_PHONE, 'user', incomingText, 'owner');
 
         pendingQuotes.delete(parsed.quoteId);
         await message.reply(`Cotizacion formal ${parsed.quoteId} enviada al cliente.`);
@@ -705,7 +705,7 @@ async function handleOwnerMessage(targetClient, message, incomingText, ownerPhon
     } catch (e) {}
     await targetClient.sendMessage(replyChatId, customerText);
     await saveConversationMessage(pending.clientPhone, 'assistant', customerText, 'quote:owner');
-    await saveConversationMessage(ownerPhoneNumber, 'user', incomingText, 'owner');
+    await saveConversationMessage(OWNER_PHONE, 'user', incomingText, 'owner');
 
     pendingQuotes.delete(parsed.quoteId);
     await message.reply(`Cotizacion ${parsed.quoteId} enviada al cliente.`);
@@ -872,24 +872,20 @@ function registerEventListeners(targetClient) {
                 return;
             }
 
-            // Si el cliente menciona producto pero falta nombre, teléfono o correo, pedir esos datos
+            // Si el cliente menciona producto, solo pedir nombre si no lo tenemos.
+            // Teléfono y correo son opcionales para no bloquear la conversación.
             if ((isQuote || isProduct) && requestedProduct) {
-                // leadState debe tener nombre, contacto y correo
-                const missing = [];
-                if (!leadState.name) missing.push('nombre');
-                if (!leadState.contactPhone) missing.push('número de teléfono');
-                if (!leadState.email) missing.push('correo electrónico');
-                if (missing.length > 0) {
+                if (!leadState.name) {
                     const aiResult = await queryAI({
-                        text: `Por favor comparte tu ${missing.join(' y ')}`,
+                        text: 'Por favor dime tu nombre para registrar tu solicitud',
                         history: sameDayHistory,
                         phoneNumber
                     });
                     await message.reply(aiResult.reply);
-                    await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-quote-contact');
+                    await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-name');
                     return;
                 }
-                // Ya hay todo: notificar al operador
+                // Con nombre es suficiente: notificar al operador y avanzar
                 await handleQuoteRequest(targetClient, message, phoneNumber, incomingText, {
                     isFormal: isFormalQuoteRequest(incomingText),
                     requestedProduct

@@ -1,32 +1,3 @@
-/**
- * Obtiene todos los números de teléfono que enviaron mensajes de usuario hoy
- * @returns {Promise<string[]>}
- */
-async function getPhonesWithUserMessagesToday() {
-    const db = getPool();
-    if (!dbReady || !db) return [];
-    const result = await db.query(
-        `SELECT DISTINCT c.phone_number
-         FROM messages m
-         JOIN conversations c ON m.conversation_id = c.id
-         WHERE m.role = 'user' AND m.created_at >= $1`,
-        [getStartOfToday()]
-    );
-    return result.rows.map(r => r.phone_number);
-}
-/**
- * Cuenta el total de mensajes de clientes recibidos hoy (rol 'user')
- * @returns {Promise<number>}
- */
-async function countUserMessagesToday() {
-    const db = getPool();
-    if (!dbReady || !db) return 0;
-    const result = await db.query(
-        `SELECT COUNT(*) FROM messages WHERE role = 'user' AND created_at >= $1`,
-        [getStartOfToday()]
-    );
-    return Number(result.rows[0]?.count || 0);
-}
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -239,7 +210,7 @@ async function getConversationLeadData(phoneNumber) {
 
     const result = await db.query(
         `
-        SELECT customer_name, contact_phone, email
+        SELECT customer_name, contact_phone, email, desired_product, delivery_address
         FROM conversations
         WHERE phone_number = $1
         LIMIT 1;
@@ -294,6 +265,39 @@ async function upsertConversationLeadData(phoneNumber, {
     );
 
     return true;
+}
+
+// ─── FIX: estas funciones van DESPUÉS de getPool, dbReady y getStartOfToday ──
+
+/**
+ * Cuenta el total de mensajes de clientes recibidos hoy (rol 'user')
+ * @returns {Promise<number>}
+ */
+async function countUserMessagesToday() {
+    const db = getPool();
+    if (!dbReady || !db) return 0;
+    const result = await db.query(
+        `SELECT COUNT(*) FROM messages WHERE role = 'user' AND created_at >= $1`,
+        [getStartOfToday()]
+    );
+    return Number(result.rows[0]?.count || 0);
+}
+
+/**
+ * Obtiene todos los números de teléfono que enviaron mensajes de usuario hoy
+ * @returns {Promise<string[]>}
+ */
+async function getPhonesWithUserMessagesToday() {
+    const db = getPool();
+    if (!dbReady || !db) return [];
+    const result = await db.query(
+        `SELECT DISTINCT c.phone_number
+         FROM messages m
+         JOIN conversations c ON m.conversation_id = c.id
+         WHERE m.role = 'user' AND m.created_at >= $1`,
+        [getStartOfToday()]
+    );
+    return result.rows.map(r => r.phone_number);
 }
 
 module.exports = {
