@@ -1,6 +1,11 @@
 CREATE TABLE IF NOT EXISTS conversations (
     id BIGSERIAL PRIMARY KEY,
     phone_number VARCHAR(32) NOT NULL UNIQUE,
+    customer_name VARCHAR(120),
+    contact_phone VARCHAR(32),
+    email VARCHAR(160),
+    desired_product VARCHAR(180),
+    delivery_address TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bot WhatsApp Configuración</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; }
+    #qr { margin: 2em 0; }
+    .config-section { margin-bottom: 2em; }
+    label { display: block; margin-bottom: 0.5em; }
+    input[type="text"], input[type="password"] { width: 300px; padding: 0.5em; }
+    button { padding: 0.5em 1em; }
+  </style>
+</head>
+<body>
+  <h1>Configuración del Bot de WhatsApp</h1>
+  <div id="bot-status" style="margin-bottom:1em; font-weight:bold;">Estado del bot: <span id="bot-status-text">Cargando...</span></div>
+  <div class="config-section">
+    <h2>Configuraciones</h2>
+    <form id="config-form">
+      <label>API Key: <input type="password" id="apiKey" name="apiKey"></label>
+      <button type="submit">Guardar</button>
+    </form>
+    <div id="config-status"></div>
+  </div>
+  <div class="config-section">
+    <h2>Escanear QR de WhatsApp</h2>
+    <div id="qr">
+      <em>Cargando QR...</em>
+    </div>
+    <button id="refresh-qr">Actualizar QR</button>
+  </div>
+  <script>
+        // Estado del bot
+        async function fetchBotStatus() {
+          try {
+            const res = await fetch('/api/status');
+            if (!res.ok) throw new Error('No se pudo obtener el estado');
+            const data = await res.json();
+            const statusText = document.getElementById('bot-status-text');
+            if (data.available) {
+              statusText.innerText = 'Disponible';
+              statusText.style.color = 'green';
+            } else {
+              statusText.innerText = data.message || 'No disponible';
+              statusText.style.color = 'red';
+            }
+          } catch (e) {
+            const statusText = document.getElementById('bot-status-text');
+            statusText.innerText = 'Error';
+            statusText.style.color = 'gray';
+          }
+        }
+        setInterval(fetchBotStatus, 5000);
+        fetchBotStatus();
+    async function fetchQR() {
+      const qrDiv = document.getElementById('qr');
+      qrDiv.innerHTML = '<em>Cargando QR...</em>';
+      try {
+        const res = await fetch('/api/qr');
+        if (!res.ok) throw new Error('No se pudo obtener el QR');
+        const data = await res.json();
+        if (data.qr) {
+          qrDiv.innerHTML = `<img src="${data.qr}" alt="QR de WhatsApp" />`;
+        } else if (data.message) {
+          qrDiv.innerHTML = `<em>${data.message}</em>`;
+        } else {
+          qrDiv.innerHTML = '<em>No hay QR disponible.</em>';
+        }
+      } catch (e) {
+        qrDiv.innerHTML = '<em>Error al cargar el QR.</em>';
+      }
+    }
+    document.getElementById('refresh-qr').onclick = fetchQR;
+    window.onload = fetchQR;
+    // Config form
+    document.getElementById('config-form').onsubmit = async function(e) {
+      e.preventDefault();
+      const apiKey = document.getElementById('apiKey').value;
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey })
+      });
+      const msg = await res.text();
+      document.getElementById('config-status').innerText = msg;
+    };
+  </script>
+</body>
+</html>

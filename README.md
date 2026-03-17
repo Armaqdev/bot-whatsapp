@@ -25,8 +25,11 @@ Este proyecto implementa un bot de WhatsApp que utiliza la interfaz web de Whats
      ```
      OPENAI_API_KEY=tu_api_key_real_aqui
      OPENAI_COOLDOWN_MS=600000
-     GEMINI_COOLDOWN_MS=300000
-     GEMINI_MODEL=gemini-2.0-flash
+       PRICE_LIST_DIR=C:/Users/venta/Desktop/documentos laptop/lista de precios junio 2025
+       PROMO_DIR=C:/Users/venta/Desktop/promo marzo
+       ALLOW_PROMO_PRICES=false
+       OWNER_PHONE=9848018317
+       OWNER_CHAT_ID=
 
      DATABASE_URL=postgresql://usuario:password@host:5432/whatsapp_bot
      PGSSL=true
@@ -86,7 +89,18 @@ whatsapp-web-bot-ai/
 2. **Escucha**: Monitorea mensajes entrantes (excluyendo grupos y mensajes propios)
 3. **Historial por número**: Guarda cada mensaje entrante/saliente en PostgreSQL por teléfono
 4. **Procesamiento contextual**: Recupera historial reciente y lo envía al modelo de IA
-5. **Respuesta**: Devuelve la respuesta generada al remitente y la almacena en DB
+5. **Catalogo local**: Para consultas de productos, usa la carpeta en `PRICE_LIST_DIR` (PDF/XLSX) para confirmar disponibilidad sin precios
+6. **Promociones del mes**: Usa `PROMO_DIR` (incluye imagenes) para detectar promociones y confirmar disponibilidad del producto sin compartir precios
+7. **Cotización manual**: Si el cliente pide cotización/precio, el bot te envia un folio a `OWNER_PHONE`; cuando respondes con ese folio, el bot reenvia tu mensaje al cliente
+8. **Respuesta**: Devuelve la respuesta generada al remitente y la almacena en DB
+
+### Flujo de Cotización
+
+- El bot solicita nombre del cliente antes de continuar la conversación.
+- Si el cliente pide cotización, el bot solicita primero teléfono y correo electrónico.
+- Cuando ya tiene nombre, teléfono y correo, envía la solicitud con folio al asesor (`OWNER_PHONE`).
+- El asesor responde con el formato: `Q-XXXXXXXX detalle de cotizacion` y el bot lo reenvía al cliente.
+- Nombre, teléfono y correo quedan guardados en PostgreSQL para no volver a solicitarlos en futuras conversaciones.
 
 ## 🛠️ Desarrollo
 
@@ -116,33 +130,12 @@ npm run dev
 ### Error de API de IA
 - Verifica que tu API key sea válida
 - Revisa los límites de uso en tu cuenta de OpenAI
-- Si recibes error 429 (cuota), el bot activa un cooldown automático (`OPENAI_COOLDOWN_MS`) y usa proveedor alterno o respuestas de respaldo
+- Si recibes error 429 (cuota), el bot activa un cooldown automático (`OPENAI_COOLDOWN_MS`) y usa respuestas de respaldo
 
 ### DB no configurada
 - Si ves `DB no configurada. El bot seguira sin historial persistente.`, revisa tu `.env`
 - Configura `DATABASE_URL` o los parámetros `PG*`
-- Si tu proveedor exige SSL (ej. Hostinger), usa `PGSSL=true`
-
-## ☁️ Despliegue en VPS (Hostinger)
-
-1. Instala Node 22 LTS y PostgreSQL (o usa PostgreSQL gestionado).
-2. Crea base de datos y usuario para el bot.
-3. Sube el proyecto y ejecuta:
-   ```bash
-   npm ci
-   ```
-4. Crea `.env` en el VPS con tus variables reales.
-5. Opcional: crea tablas manualmente:
-   ```bash
-   psql "$DATABASE_URL" -f sql/init.sql
-   ```
-6. Inicia el bot con PM2:
-   ```bash
-   npm i -g pm2
-   pm2 start src/index.js --name whatsapp-bot
-   pm2 save
-   pm2 startup
-   ```
+- Si tu proveedor PostgreSQL exige SSL, usa `PGSSL=true`
 
 ## 📄 Licencia
 

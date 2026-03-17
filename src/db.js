@@ -1,3 +1,32 @@
+/**
+ * Obtiene todos los números de teléfono que enviaron mensajes de usuario hoy
+ * @returns {Promise<string[]>}
+ */
+async function getPhonesWithUserMessagesToday() {
+    const db = getPool();
+    if (!dbReady || !db) return [];
+    const result = await db.query(
+        `SELECT DISTINCT c.phone_number
+         FROM messages m
+         JOIN conversations c ON m.conversation_id = c.id
+         WHERE m.role = 'user' AND m.created_at >= $1`,
+        [getStartOfToday()]
+    );
+    return result.rows.map(r => r.phone_number);
+}
+/**
+ * Cuenta el total de mensajes de clientes recibidos hoy (rol 'user')
+ * @returns {Promise<number>}
+ */
+async function countUserMessagesToday() {
+    const db = getPool();
+    if (!dbReady || !db) return 0;
+    const result = await db.query(
+        `SELECT COUNT(*) FROM messages WHERE role = 'user' AND created_at >= $1`,
+        [getStartOfToday()]
+    );
+    return Number(result.rows[0]?.count || 0);
+}
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -54,10 +83,21 @@ async function initDatabase() {
                 CREATE TABLE IF NOT EXISTS conversations (
                     id BIGSERIAL PRIMARY KEY,
                     phone_number VARCHAR(32) NOT NULL UNIQUE,
+                    customer_name VARCHAR(120),
+                    contact_phone VARCHAR(32),
+                    email VARCHAR(160),
+                    desired_product VARCHAR(180),
+                    delivery_address TEXT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
             `);
+
+            await db.query('ALTER TABLE conversations ADD COLUMN IF NOT EXISTS customer_name VARCHAR(120);');
+            await db.query('ALTER TABLE conversations ADD COLUMN IF NOT EXISTS contact_phone VARCHAR(32);');
+            await db.query('ALTER TABLE conversations ADD COLUMN IF NOT EXISTS email VARCHAR(160);');
+            await db.query('ALTER TABLE conversations ADD COLUMN IF NOT EXISTS desired_product VARCHAR(180);');
+            await db.query('ALTER TABLE conversations ADD COLUMN IF NOT EXISTS delivery_address TEXT;');
 
             await db.query(`
                 CREATE TABLE IF NOT EXISTS messages (
@@ -137,7 +177,12 @@ async function saveConversationMessage(phoneNumber, role, content, provider = nu
     return true;
 }
 
-async function getRecentConversationHistory(phoneNumber, limit = 12) {
+function getStartOfToday() {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+}
+
+async function getRecentConversationHistory(phoneNumber, limit = 12, options = {}) {
     const db = getPool();
     if (!dbReady || !db) {
         return [];
@@ -149,16 +194,30 @@ async function getRecentConversationHistory(phoneNumber, limit = 12) {
     }
 
     const safeLimit = Math.max(1, Math.min(Number(limit) || 12, 50));
-    const result = await db.query(
-        `
-        SELECT role, content, created_at
-        FROM messages
-        WHERE conversation_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2;
-        `,
-        [conversationId, safeLimit]
-    );
+    const sameDayOnly = Boolean(options.sameDayOnly);
+
+    const result = sameDayOnly
+        ? await db.query(
+            `
+            SELECT role, content, created_at
+            FROM messages
+            WHERE conversation_id = $1
+              AND created_at >= $2
+            ORDER BY created_at DESC
+            LIMIT $3;
+            `,
+            [conversationId, getStartOfToday(), safeLimit]
+        )
+        : await db.query(
+            `
+            SELECT role, content, created_at
+            FROM messages
+            WHERE conversation_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2;
+            `,
+            [conversationId, safeLimit]
+        );
 
     return result.rows.reverse().map((row) => ({
         role: row.role,
@@ -167,9 +226,83 @@ async function getRecentConversationHistory(phoneNumber, limit = 12) {
     }));
 }
 
+async function getConversationLeadData(phoneNumber) {
+    const db = getPool();
+    if (!dbReady || !db) {
+        return null;
+    }
+
+    const normalized = normalizePhoneNumber(phoneNumber);
+    if (!normalized) {
+        return null;
+    }
+
+    const result = await db.query(
+        `
+        SELECT customer_name, contact_phone, email
+        FROM conversations
+        WHERE phone_number = $1
+        LIMIT 1;
+        `,
+        [normalized]
+    );
+
+    if (result.rows.length === 0) {
+        return null;
+    }
+
+    return {
+        name: result.rows[0].customer_name || '',
+        contactPhone: result.rows[0].contact_phone || '',
+        email: result.rows[0].email || '',
+        desiredProduct: result.rows[0].desired_product || '',
+        deliveryAddress: result.rows[0].delivery_address || ''
+    };
+}
+
+async function upsertConversationLeadData(phoneNumber, {
+    name = null,
+    contactPhone = null,
+    email = null,
+    desiredProduct = null,
+    deliveryAddress = null
+} = {}) {
+    const db = getPool();
+    if (!dbReady || !db) {
+        return false;
+    }
+
+    const normalized = normalizePhoneNumber(phoneNumber);
+    if (!normalized) {
+        return false;
+    }
+
+    await db.query(
+        `
+        INSERT INTO conversations (phone_number, customer_name, contact_phone, email, desired_product, delivery_address, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        ON CONFLICT (phone_number)
+        DO UPDATE SET
+            customer_name = COALESCE($2, conversations.customer_name),
+            contact_phone = COALESCE($3, conversations.contact_phone),
+            email = COALESCE($4, conversations.email),
+            desired_product = COALESCE($5, conversations.desired_product),
+            delivery_address = COALESCE($6, conversations.delivery_address),
+            updated_at = NOW();
+        `,
+        [normalized, name, contactPhone, email, desiredProduct, deliveryAddress]
+    );
+
+    return true;
+}
+
 module.exports = {
     initDatabase,
     normalizePhoneNumber,
     saveConversationMessage,
-    getRecentConversationHistory
+    getRecentConversationHistory,
+    getConversationLeadData,
+    upsertConversationLeadData,
+    countUserMessagesToday,
+    getPhonesWithUserMessagesToday
 };

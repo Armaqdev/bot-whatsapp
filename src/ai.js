@@ -1,51 +1,155 @@
 const OpenAI = require('openai');
+const { getCatalogContext, getCatalogReply, getPromotionContext, getPromotionReply } = require('./catalog');
 require('dotenv').config();
 
+const AI_PROVIDER = String(process.env.AI_PROVIDER || 'openai').toLowerCase();
+const USE_OLLAMA = AI_PROVIDER === 'ollama';
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434/v1';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
+
 const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY || 'sk-test-key-for-demo', // Key de prueba temporal
+    apiKey: USE_OLLAMA ? (process.env.OLLAMA_API_KEY || 'ollama') : (process.env.OPENAI_API_KEY || 'sk-test-key-for-demo'),
+    baseURL: USE_OLLAMA ? OLLAMA_BASE_URL : undefined,
 });
 
 const OPENAI_COOLDOWN_MS = Number(process.env.OPENAI_COOLDOWN_MS || 10 * 60 * 1000);
-const GEMINI_COOLDOWN_MS = Number(process.env.GEMINI_COOLDOWN_MS || 5 * 60 * 1000);
-const GEMINI_MODELS = [
-    process.env.GEMINI_MODEL || 'gemini-2.0-flash',
-    'gemini-2.0-flash-lite',
-    'gemini-1.5-flash'
-];
 let openAIDisabledUntil = 0;
-let geminiDisabledUntil = 0;
 
 const fallbackResponses = [
-    '¡Hola! Soy el asistente de ARMAQ Maquinaria Ligera. Estamos en Calle 50 Norte esquina con 76, Playa del Carmen. Lunes a viernes 8am-6pm.',
-    '¡Hola! En ARMAQ Maquinaria Ligera vendemos maquinaria para construcción. ¿Qué producto te interesa?',
-    '¡Hola! Nuestra sucursal en Playa del Carmen atiende de lunes a viernes de 8am a 6pm. Solo venta de equipos.',
-    '¡Hola! Somos ARMAQ Maquinaria Ligera, especialistas en venta de equipo para construcción en Playa del Carmen.',
+    'Claro, ya lo reviso y te doy la información en un momento.',
+    'Perfecto, en un momento te comparto la información.',
+    'Gracias por tu mensaje. En breve te confirmo lo que necesitas.',
+    'Entendido, ya estoy revisando tu solicitud para darte respuesta enseguida.',
 ];
 
-function toOpenAIHistory(history) {
-    if (!Array.isArray(history)) {
-        return [];
-    }
+// ─── Utilidades de texto ──────────────────────────────────────────────────────
 
-    return history
-        .filter((entry) => entry && (entry.role === 'user' || entry.role === 'assistant') && entry.content)
-        .slice(-10)
-        .map((entry) => ({
-            role: entry.role,
-            content: entry.content
-        }));
+function normalizeText(value) {
+    return String(value || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .trim();
 }
 
-function toGeminiHistoryBlock(history) {
-    if (!Array.isArray(history) || history.length === 0) {
-        return 'Sin historial previo.';
-    }
+// ─── Detección de intenciones ─────────────────────────────────────────────────
 
+function isGreetingMessage(text) {
+    const n = normalizeText(text);
+    if (!n || n.split(' ').length > 4) return false;
+    const greetings = ['hola', 'buen dia', 'buenos dias', 'buenas tardes', 'buenas noches', 'que tal', 'buenas', 'hey'];
+    return greetings.some((w) => n === w || n.startsWith(`${w} `));
+}
+
+function isFarewellMessage(text) {
+    const n = normalizeText(text);
+    if (!n) return false;
+    const farewells = [
+        'gracias', 'muchas gracias', 'ok', 'al rato paso', 'nos vemos', 'hasta luego', 'bye',
+        'adios', 'me avisas', 'estamos en contacto', 'luego te aviso', 'luego paso', 'luego regreso',
+        'luego te marco', 'luego te llamo', 'luego te escribo', 'hasta mañana', 'hasta manana',
+        'hasta pronto', 'hasta la proxima', 'buenas noches', 'saludos', 'listo', 'perfecto',
+        'excelente', 'de acuerdo', 'vale', 'va', 'sale',
+    ];
+    return farewells.some((w) => n === w || n.startsWith(`${w} `) || n.endsWith(` ${w}`));
+}
+
+function isRentalRequest(text) {
+    const n = normalizeText(text);
+    return /\brenta\b|\brentar\b|\balquiler\b|\balquilar\b/.test(n);
+}
+
+function isFreightRequest(text) {
+    const n = normalizeText(text);
+    return /\bflete\b|\benvio\b|\benvío\b|\bentrega\b|\btransporte\b|\bcuanto.*flete\b|\bcuanto.*envio\b|\bcuanto.*entrega\b/.test(n);
+}
+
+/**
+ * Detecta si el cliente está preguntando por disponibilidad de un producto.
+ * Ej: "¿tienen andamios?", "¿manejan compresores?", "¿hay vibradores?"
+ */
+function isAvailabilityRequest(text) {
+    const n = normalizeText(text);
+    return /\btienen\b|\btiene\b|\bmanejan\b|\bmaneja\b|\bhay\b|\bdisponib|\bcuentan\b|\bvenden\b|\bvende\b/.test(n);
+}
+
+/**
+ * Detecta solicitudes de cotización o precio.
+ * Ej: "¿cuánto cuesta?", "me puedes cotizar", "precio de..."
+ */
+function isQuoteRequest(text) {
+    const n = normalizeText(text);
+    return /\bcoti(z|s)|\bprecio\b|\bcuanto cuesta\b|\bcuanto vale\b|\bme das un precio\b|\bme puedes dar el costo\b|\bcosto de\b|\bimporte\b|\bcuanto sale\b/.test(n);
+}
+
+/**
+ * Detecta preguntas sobre horarios o ubicación.
+ */
+function isLocationOrHoursRequest(text) {
+    const n = normalizeText(text);
+    return /\bhorario\b|\bque hora\b|\ba que hora\b|\bcuando abren\b|\bcuando cierran\b|\bdonde estan\b|\bdireccion\b|\bubicacion\b|\bcomo llegar\b|\bdonde queda\b|\bmapa\b/.test(n);
+}
+
+// ─── Respuestas de política ───────────────────────────────────────────────────
+
+function getWelcomeMessage() {
+    return 'Hola, asesor de ventas ARMAQ. ¿En qué le puedo ayudar?';
+}
+
+function getFreightReply() {
+    return 'El envío dentro de Playa del Carmen es sin costo. Para entregas fuera de la ciudad, el flete se incluye en la cotización formal. ¿A qué zona o ciudad necesitas el envío?';
+}
+
+function getRentalReply() {
+    return 'Por el momento solo manejamos venta de equipos, no renta. Si gustas, te confirmo disponibilidad del equipo que necesitas y te compartimos opciones.';
+}
+
+function getLocationReply() {
+    return 'Estamos en Calle 50 Norte esquina con 76, Col. Luis Donaldo Colosio, Playa del Carmen. Aquí el mapa: https://maps.app.goo.gl/nDFcCSeze3XhSk1K7\nAtendemos lunes a viernes de 8:00 AM a 6:00 PM.';
+}
+
+// ─── Prompt del sistema ───────────────────────────────────────────────────────
+
+function getSystemPrompt() {
+    return `Eres un asesor de ventas de ARMAQ Maquinaria Ligera, empresa especializada en venta de maquinaria y equipo para construcción en Playa del Carmen, Quintana Roo. Tu canal es WhatsApp.
+
+## DATOS DE LA EMPRESA
+- Dirección: Calle 50 Norte esquina con 76, Col. Luis Donaldo Colosio, Playa del Carmen, Q. Roo
+- Mapa: https://maps.app.goo.gl/nDFcCSeze3XhSk1K7
+- Horario: Lunes a viernes 8:00 AM – 6:00 PM. No laboramos sábados ni domingos.
+- Giro: VENTA de maquinaria para construcción (no manejamos renta)
+
+## PRODUCTOS QUE VENDEMOS
+Andamios, puntales, malacates, polipastos, compresores, generadores, vibradores de concreto, cortadoras de plasma, herramienta y materiales para construcción.
+
+## REGLAS DE RESPUESTA
+1. NUNCA menciones precios exactos; si preguntan, indícales que la cotización se hace según el equipo y cantidad, e invítalos a solicitarla.
+2. Cuando el cliente pregunte por disponibilidad de un producto, CONFIRMA que lo manejas (si está en tu lista) y PREGUNTA cuántas piezas necesita y para cuándo, para orientar mejor.
+3. Si el cliente solicita una cotización, pide: (a) qué equipo necesita, (b) cantidad, (c) si es para entrega o recoge en tienda. Con esa info el equipo le prepara la cotización.
+4. Si preguntan por ubicación u horarios, da la información completa de una sola vez.
+5. Si el mensaje es ambiguo, haz UNA sola pregunta de aclaración breve y directa.
+6. No des recomendaciones técnicas detalladas (eso lo maneja el equipo en piso).
+7. No repitas el saludo en cada mensaje; ve directo a la información.
+8. Nunca te identifiques como bot, IA o asistente virtual.
+9. No menciones marcas específicas de equipos en respuestas generales.
+10. Cierra siempre con una invitación a continuar la conversación o a acercarse a la tienda.
+
+## TONO Y FORMATO
+- Lenguaje: español neutro, amable y directo, como un vendedor real de WhatsApp
+- Longitud: máximo 4 líneas por respuesta
+- Evita palabras de relleno: "por supuesto", "claro que sí", "con gusto"
+- Usa puntuación natural; no listas de bullets a menos que sea necesario
+`;
+}
+
+// ─── Helpers de IA ───────────────────────────────────────────────────────────
+
+function toOpenAIHistory(history) {
+    if (!Array.isArray(history)) return [];
     return history
-        .filter((entry) => entry && (entry.role === 'user' || entry.role === 'assistant') && entry.content)
+        .filter((e) => e && (e.role === 'user' || e.role === 'assistant') && e.content)
         .slice(-10)
-        .map((entry) => `${entry.role.toUpperCase()}: ${entry.content}`)
-        .join('\n');
+        .map((e) => ({ role: e.role, content: e.content }));
 }
 
 function getFallbackResponse() {
@@ -53,205 +157,128 @@ function getFallbackResponse() {
 }
 
 function canUseOpenAI() {
-    if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY === 'tu_api_key_aqui') {
-        return false;
-    }
-
+    if (USE_OLLAMA) return true;
+    if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY === 'tu_api_key_aqui') return false;
     if (Date.now() < openAIDisabledUntil) {
-        const remainingSec = Math.ceil((openAIDisabledUntil - Date.now()) / 1000);
-        console.log(`OpenAI en cooldown por cuota. Reintento en ${remainingSec}s`);
+        const remaining = Math.ceil((openAIDisabledUntil - Date.now()) / 1000);
+        console.log(`OpenAI en cooldown. Reintento en ${remaining}s`);
         return false;
     }
-
     return true;
 }
 
-function getSystemPrompt() {
-    return `Eres un asistente virtual para ARMAQ Maquinaria Ligera, una empresa de venta de maquinaria y equipo para construcción en Playa del Carmen, Quintana Roo.
-
-INFORMACIÓN DEL NEGOCIO:
-- Nombre: ARMAQ Maquinaria Ligera
-- Ubicación: Calle 50 Norte esquina con 76, Colonia Luis Donaldo Colosio, Playa del Carmen, Quintana Roo
-- Google Maps: https://maps.app.goo.gl/nDFcCSeze3XhSk1K7
-- Horarios: Lunes a viernes de 8:00 AM a 6:00 PM. Sábados y domingos: No laboramos
-- Servicios: Venta de maquinaria para construcción (NO manejamos renta)
-- Productos: Vendemos maquinaria para construcción incluyendo:
-  * Andamios y puntales
-  * Malacates y polipastos
-  * Compresores
-  * Generadores
-  * Vibradores de concreto
-  * Cortadoras de plasma
-  * Equipos de construcción en general
-  * Materiales y herramientas para construcción
-
-IMPORTANTE:
-- NO mencionamos precios específicos
-- Somos una empresa de VENTA, NO de renta
-- Sé amable y profesional
-- Responde como asesor comercial por WhatsApp: claro, humano y directo
-- Cuando te pidan informacion comercial, cierra con una invitacion a continuar (ej: "si quieres te comparto opciones")
-- Si el mensaje es ambiguo, haz una sola pregunta de aclaracion breve
-- Si preguntan por productos específicos, confirma disponibilidad sin precios
-- Si preguntan por ubicación, proporciona la dirección completa y el enlace de Google Maps
-- Si preguntan por horarios, proporciona la información exacta
-- Si preguntan por renta, aclara que solo vendemos equipos
-- Si no sabes algo específico, ofrece contactar directamente con la sucursal
-
-FORMATO DE RESPUESTA:
-- Maximo 4 lineas
-- Usa espanol neutro
-- Evita texto repetitivo o generico
-`;
-}
-
 async function tryOpenAI(text, history, phoneNumber) {
-    if (!canUseOpenAI()) {
-        return null;
-    }
+    if (!canUseOpenAI()) return null;
 
-    console.log('Intentando con OpenAI... API key presente:', process.env.OPENAI_API_KEY.substring(0, 10) + '...');
+    const label = USE_OLLAMA ? `Ollama (${OLLAMA_MODEL})` : 'OpenAI';
+    console.log(`Intentando con ${label}...`);
+
+    const [catalogContext, promotionContext] = await Promise.all([
+        getCatalogContext(text),
+        getPromotionContext(text),
+    ]);
+
     const messages = [
-        {
-            role: 'system',
-            content: getSystemPrompt()
-        },
-        {
-            role: 'system',
-            content: `Telefono del cliente: ${phoneNumber || 'desconocido'}. Usa esto solo para contexto interno, no lo repitas.`
-        },
+        { role: 'system', content: getSystemPrompt() },
+        { role: 'system', content: `Teléfono del cliente: ${phoneNumber || 'desconocido'}. Solo para contexto interno.` },
+        { role: 'system', content: catalogContext || 'Sin contexto adicional de catálogo para este mensaje.' },
+        { role: 'system', content: promotionContext || 'Sin promociones activas para este mensaje.' },
         ...toOpenAIHistory(history),
-        {
-            role: 'user',
-            content: text
-        }
+        { role: 'user', content: text },
     ];
 
     const completion = await openai.chat.completions.create({
-        model: 'gpt-3.5-turbo',
+        model: USE_OLLAMA ? OLLAMA_MODEL : 'gpt-3.5-turbo',
         messages,
-        max_tokens: 150,
-        temperature: 0.55,
+        max_tokens: 180,   // Ligeramente más margen para respuestas completas
+        temperature: 0.45, // Más consistente y menos genérico
     });
 
-    const response = completion.choices[0].message.content.trim();
-    console.log('OpenAI respondió correctamente');
-    return { reply: response, provider: 'openai' };
+    const reply = completion.choices[0].message.content.trim();
+    const provider = USE_OLLAMA ? `ollama:${OLLAMA_MODEL}` : 'openai';
+    console.log(`${label} respondió correctamente`);
+    return { reply, provider };
 }
 
-async function tryGemini(text, history, phoneNumber) {
-    if (!process.env.GOOGLE_API_KEY) {
-        return null;
-    }
-
-    if (Date.now() < geminiDisabledUntil) {
-        const remainingSec = Math.ceil((geminiDisabledUntil - Date.now()) / 1000);
-        console.log(`Gemini en cooldown por cuota. Reintento en ${remainingSec}s`);
-        return null;
-    }
-
-    const { GoogleGenerativeAI } = require('@google/generative-ai');
-    const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
-    const prompt = `Eres un asistente para ARMAQ Maquinaria Ligera - venta de maquinaria.
-
-Información del negocio:
-- Nombre: ARMAQ Maquinaria Ligera
-- Ubicación: Calle 50 Norte esquina con 76, Colonia Luis Donaldo Colosio, Playa del Carmen, Quintana Roo
-- Google Maps: https://maps.app.goo.gl/nDFcCSeze3XhSk1K7
-- Horarios: Lunes a viernes 8am a 6pm, sábados y domingos no laboramos
-- Servicios: Solo venta de equipos, NO manejamos renta
-- Productos: Maquinaria para construcción (andamios, puntales, malacates, compresores, generadores, etc.)
-
-Telefono del cliente (solo contexto interno): ${phoneNumber || 'desconocido'}
-
-Historial reciente:
-${toGeminiHistoryBlock(history)}
-
-Pregunta del usuario:
-${text}
-
-Instrucciones de respuesta:
-- Espanol claro y natural para WhatsApp
-- Maximo 4 lineas
-- No menciones precios
-- Si preguntan por renta, aclara venta unicamente
-- Si falta informacion, haz una sola pregunta corta de aclaracion
-- Cierra con invitacion a continuar la conversacion.`;
-
-    for (const modelName of GEMINI_MODELS) {
-        try {
-            console.log(`Intentando Gemini con modelo: ${modelName}`);
-            const model = genAI.getGenerativeModel({
-                model: modelName,
-                generationConfig: {
-                    maxOutputTokens: 150,
-                    temperature: 0.7,
-                },
-            });
-
-            const result = await model.generateContent(prompt);
-            const response = await result.response;
-            return { reply: response.text().trim(), provider: `gemini:${modelName}` };
-        } catch (error) {
-            const statusCode = error?.status || error?.statusCode;
-            const isQuotaError = statusCode === 429 || String(error?.message || '').includes('429');
-            if (isQuotaError) {
-                geminiDisabledUntil = Date.now() + GEMINI_COOLDOWN_MS;
-                console.error(`Gemini cuota excedida (429). Activando cooldown por ${Math.ceil(GEMINI_COOLDOWN_MS / 60000)} min.`);
-                return null;
-            }
-
-            console.error(`Error con modelo Gemini ${modelName}:`, error.message);
-        }
-    }
-
-    return null;
-}
+// ─── Función principal ────────────────────────────────────────────────────────
 
 /**
- * Consulta al modelo de IA con el texto proporcionado
- * @param {object} params - Parametros de consulta
+ * Consulta al modelo de IA con el texto proporcionado.
+ * @param {object} params
  * @param {string} params.text - Mensaje del usuario
  * @param {Array<{role: string, content: string}>} [params.history] - Historial reciente
- * @param {string} [params.phoneNumber] - Numero de telefono normalizado
- * @returns {{reply: string, provider: string}} Respuesta y proveedor usado
+ * @param {string} [params.phoneNumber] - Número de teléfono normalizado
+ * @returns {Promise<{reply: string, provider: string}>}
  */
 async function queryAI({ text, history = [], phoneNumber = '' }) {
     try {
-        console.log('Procesando mensaje:', text.substring(0, 50) + '...');
-        try {
-            const openAIResponse = await tryOpenAI(text, history, phoneNumber);
-            if (openAIResponse) {
-                return openAIResponse;
-            }
-        } catch (error) {
-            const statusCode = error?.status || error?.statusCode;
-            const isQuotaError = statusCode === 429 || String(error?.message || '').includes('429');
+        console.log('Procesando mensaje:', text.substring(0, 60) + (text.length > 60 ? '...' : ''));
 
-            if (isQuotaError) {
+        // 1. Saludo simple → respuesta fija
+        if (isGreetingMessage(text)) {
+            return { reply: getWelcomeMessage(), provider: 'welcome' };
+        }
+
+        // 2. Flete / envío → política clara + pregunta de destino
+        if (isFreightRequest(text)) {
+            return { reply: getFreightReply(), provider: 'policy:freight' };
+        }
+
+        // 3. Renta → aclaración + oferta de venta
+        if (isRentalRequest(text)) {
+            return { reply: getRentalReply(), provider: 'policy:rental' };
+        }
+
+        // 4. Ubicación / horarios → respuesta completa de una vez
+        if (isLocationOrHoursRequest(text)) {
+            return { reply: getLocationReply(), provider: 'policy:location' };
+        }
+
+        // 5. Promociones del catálogo local
+        try {
+            const promotionReply = await getPromotionReply(text);
+            if (promotionReply) return { reply: promotionReply, provider: 'promotion' };
+        } catch (err) {
+            console.error('Error en promociones:', err.message);
+        }
+
+        // 6. Respuesta de catálogo local (disponibilidad / producto específico)
+        try {
+            const catalogReply = await getCatalogReply(text);
+            if (catalogReply) return { reply: catalogReply, provider: 'catalog' };
+        } catch (err) {
+            console.error('Error en catálogo:', err.message);
+        }
+
+        // 7. IA (OpenAI / Ollama) con contexto enriquecido
+        try {
+            const aiResponse = await tryOpenAI(text, history, phoneNumber);
+            if (aiResponse) return aiResponse;
+        } catch (err) {
+            if (USE_OLLAMA) {
+                console.error('Error en Ollama:', err.message);
+                return { reply: getFallbackResponse(), provider: 'fallback:ollama-error' };
+            }
+
+            const status = err?.status || err?.statusCode;
+            const isQuota = status === 429 || String(err?.message || '').includes('429');
+
+            if (isQuota) {
                 openAIDisabledUntil = Date.now() + OPENAI_COOLDOWN_MS;
-                console.error(`OpenAI cuota excedida (429). Activando cooldown por ${Math.ceil(OPENAI_COOLDOWN_MS / 60000)} min.`);
+                console.error(`OpenAI cuota excedida. Cooldown por ${Math.ceil(OPENAI_COOLDOWN_MS / 60000)} min.`);
             } else {
-                console.error('Error en OpenAI:', error.message);
+                console.error('Error en OpenAI:', err.message);
             }
         }
 
-        try {
-            const geminiResponse = await tryGemini(text, history, phoneNumber);
-            if (geminiResponse) {
-                return geminiResponse;
-            }
-        } catch (error) {
-            console.error('Error en Gemini:', error.message);
-        }
-
-        console.log('Ninguna API disponible, usando respuestas de respaldo');
+        // 8. Fallback genérico
+        console.log('IA no disponible, usando fallback.');
         return { reply: getFallbackResponse(), provider: 'fallback' };
 
-    } catch (error) {
-        console.error('Error consultando IA:', error.message);
+    } catch (err) {
+        console.error('Error general en queryAI:', err.message);
         return { reply: getFallbackResponse(), provider: 'fallback:error' };
     }
 }
 
-module.exports = { queryAI };
+module.exports = { queryAI, isFarewellMessage };
