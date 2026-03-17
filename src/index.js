@@ -374,52 +374,20 @@ async function handleQuoteRequest(targetClient, message, phoneNumber, incomingTe
             if (!ownerChatId) {
                 console.warn('⚠️  OWNER_PHONE/OWNER_CHAT_ID no configurado. No se pudo notificar al asesor.');
             }
-            const customerReply = advisorNotified
-                ? (isFormal
-                    ? 'Claro, ya lo reviso y te doy la informacion en un momento. Tambien te comparto tu cotizacion formal en PDF en breve.'
-                    : 'Claro, ya lo reviso y te doy la informacion en un momento.')
-                : 'Perfecto. Ya registre tu solicitud y te respondemos por este medio en breve.';
-            await message.reply(customerReply);
-            await saveConversationMessage(phoneNumber, 'assistant', customerReply, isFormal ? 'quote:formal-pending' : 'quote:pending');
+            // Usar historial y queryAI para la respuesta
+            const history = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
+            const aiResult = await queryAI({
+                text: incomingText,
+                history,
+                phoneNumber
+            });
+            await message.reply(aiResult.reply);
+            await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, isFormal ? 'quote:formal-pending' : 'quote:pending');
         }
         // Registrar una cotización pendiente por cada producto detectado
         for (const prod of requestedProducts) {
             await registrarCotizacion(prod);
         }
-    const ownerInstruction = [
-        'Nueva solicitud de cotizacion.',
-        `Folio: ${quoteId}`,
-        `Cliente: ${phoneNumber}`,
-        `Tipo: ${isFormal ? 'Cotizacion formal PDF' : 'Precio y tiempo de entrega'}`,
-        `Equipo solicitado: ${requestedProduct || 'No identificado en mensaje (revisar chat)'}`,
-        `Mensaje: ${incomingText}`,
-        '',
-        isFormal
-            ? `Responde enviando PDF con el folio en el texto/caption: ${quoteId}`
-            : `Responde con: ${quoteId} Precio y tiempo de entrega`
-    ].join('\n');
-
-    let advisorNotified = false;
-    if (ownerChatId) {
-        try {
-            await targetClient.sendMessage(ownerChatId, ownerInstruction);
-            advisorNotified = true;
-        } catch (error) {
-            console.error('❌ No se pudo enviar la solicitud al asesor:', error.message);
-        }
-    }
-
-    if (!ownerChatId) {
-        console.warn('⚠️  OWNER_PHONE/OWNER_CHAT_ID no configurado. No se pudo notificar al asesor.');
-    }
-
-    const customerReply = advisorNotified
-        ? (isFormal
-            ? 'Claro, ya lo reviso y te doy la informacion en un momento. Tambien te comparto tu cotizacion formal en PDF en breve.'
-            : 'Claro, ya lo reviso y te doy la informacion en un momento.')
-        : 'Perfecto. Ya registre tu solicitud y te respondemos por este medio en breve.';
-    await message.reply(customerReply);
-    await saveConversationMessage(phoneNumber, 'assistant', customerReply, isFormal ? 'quote:formal-pending' : 'quote:pending');
 }
 
 async function handleLeadCapture(message, phoneNumber, incomingText, leadState) {
@@ -434,12 +402,17 @@ async function handleLeadCapture(message, phoneNumber, incomingText, leadState) 
         leadState.awaitingName = false;
         await upsertConversationLeadData(phoneNumber, { name: detectedName });
 
-        // If the message is just the name, acknowledge and stop; otherwise keep flow without extra interruption.
+        // If the message is just the name, acknowledge y responder con IA
         const nameOnly = String(incomingText || '').trim().split(/\s+/).length <= 4;
         if (nameOnly) {
-            const ack = `Mucho gusto, ${detectedName}. ¿En que equipo te puedo apoyar hoy?`;
-            await message.reply(ack);
-            await saveConversationMessage(phoneNumber, 'assistant', ack, 'lead:name-captured');
+            const history = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
+            const aiResult = await queryAI({
+                text: `Mi nombre es ${detectedName}`,
+                history,
+                phoneNumber
+            });
+            await message.reply(aiResult.reply);
+            await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:name-captured');
             return true;
         }
 
@@ -451,9 +424,14 @@ async function handleLeadCapture(message, phoneNumber, incomingText, leadState) 
     if (!leadState.awaitingName || now - leadState.lastNamePromptAt > promptCooldownMs) {
         leadState.awaitingName = true;
         leadState.lastNamePromptAt = now;
-        const askName = 'Para atenderte mejor, ¿me compartes tu nombre por favor?';
-        await message.reply(askName);
-        await saveConversationMessage(phoneNumber, 'assistant', askName, 'lead:ask-name');
+        const history = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
+        const aiResult = await queryAI({
+            text: 'Por favor dime tu nombre',
+            history,
+            phoneNumber
+        });
+        await message.reply(aiResult.reply);
+        await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-name');
         return false;
     }
 
@@ -504,9 +482,14 @@ async function handleQuoteDataCapture(targetClient, message, phoneNumber, incomi
         }
         leadState.lastQuotePromptKey = promptKey;
 
-        const askContact = `Para continuar con tu cotizacion, comparteme tu ${missing.join(' y ')}.`;
-        await message.reply(askContact);
-        await saveConversationMessage(phoneNumber, 'assistant', askContact, 'lead:ask-quote-contact');
+        const history = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
+        const aiResult = await queryAI({
+            text: `Por favor comparte tu ${missing.join(' y ')}`,
+            history,
+            phoneNumber
+        });
+        await message.reply(aiResult.reply);
+        await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-quote-contact');
         return true;
     }
 
@@ -848,8 +831,14 @@ function registerEventListeners(targetClient) {
             const { isFarewellMessage } = require('./ai');
             if (isFarewellMessage(incomingText)) {
                 leadState.closed = true;
-                await saveConversationMessage(phoneNumber, 'assistant', '¡Gracias por tu preferencia! Si necesitas algo más, aquí seguimos a tus órdenes.', 'farewell');
-                await message.reply('¡Gracias por tu preferencia! Si necesitas algo más, aquí seguimos a tus órdenes.');
+                const sameDayHistory = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
+                const aiResult = await queryAI({
+                    text: incomingText,
+                    history: sameDayHistory,
+                    phoneNumber
+                });
+                await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'farewell');
+                await message.reply(aiResult.reply);
                 console.log('  ↳ 🚪 Conversación marcada como cerrada por despedida');
                 return;
             }
@@ -865,7 +854,6 @@ function registerEventListeners(targetClient) {
                 console.log('  ↳ 🔓 Conversación reabierta por nueva solicitud');
             }
 
-
             // FLUJO CORREGIDO: Solo notificar al operador si ya hay producto y datos mínimos
             const isQuote = isFormalQuoteRequest(incomingText) || isQuoteRequest(incomingText);
             const isProduct = isProductIntent(incomingText);
@@ -874,8 +862,13 @@ function registerEventListeners(targetClient) {
 
             // Si el cliente pide cotización pero NO hay producto, primero preguntar por el producto
             if (isQuote && !requestedProduct) {
-                await message.reply('¿Qué equipo necesitas cotizar?');
-                await saveConversationMessage(phoneNumber, 'assistant', '¿Qué equipo necesitas cotizar?', 'lead:ask-product');
+                const aiResult = await queryAI({
+                    text: '¿Qué equipo necesitas cotizar?',
+                    history: sameDayHistory,
+                    phoneNumber
+                });
+                await message.reply(aiResult.reply);
+                await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-product');
                 return;
             }
 
@@ -887,9 +880,13 @@ function registerEventListeners(targetClient) {
                 if (!leadState.contactPhone) missing.push('número de teléfono');
                 if (!leadState.email) missing.push('correo electrónico');
                 if (missing.length > 0) {
-                    const ask = `Para continuar con tu cotización, ¿me compartes tu ${missing.join(' y ')}?`;
-                    await message.reply(ask);
-                    await saveConversationMessage(phoneNumber, 'assistant', ask, 'lead:ask-quote-contact');
+                    const aiResult = await queryAI({
+                        text: `Por favor comparte tu ${missing.join(' y ')}`,
+                        history: sameDayHistory,
+                        phoneNumber
+                    });
+                    await message.reply(aiResult.reply);
+                    await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-quote-contact');
                     return;
                 }
                 // Ya hay todo: notificar al operador
@@ -901,10 +898,10 @@ function registerEventListeners(targetClient) {
                 return;
             }
 
-            const history = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
+            // --- BUG 2 y 3: Usar sameDayHistory y asegurar orden correcto ---
             const result = await queryAI({
                 text: incomingText,
-                history,
+                history: sameDayHistory,
                 phoneNumber
             });
 
