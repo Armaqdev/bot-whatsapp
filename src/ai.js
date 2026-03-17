@@ -108,6 +108,35 @@ function getLocationReply() {
     return 'Estamos en Calle 50 Norte esquina con 76, Col. Luis Donaldo Colosio, Playa del Carmen. Aquí el mapa: https://maps.app.goo.gl/nDFcCSeze3XhSk1K7\nAtendemos lunes a viernes de 8:00 AM a 6:00 PM.';
 }
 
+function isPaymentRequest(text) {
+    const n = normalizeText(text);
+    return /\bpago\b|\bpagar\b|\bformas?\s+de\s+pago\b|\bmetodos?\s+de\s+pago\b|\btarjeta\b|\befectivo\b|\btransferencia\b|\bdepósito\b|\bdeposito\b|\bcomo\s+pago\b|\bcomo\s+se\s+paga\b/.test(n);
+}
+
+function isDeliveryOutsidePlaya(text) {
+    const n = normalizeText(text);
+    // Detectar si el cliente mencionó entrega/envío fuera de Playa del Carmen
+    const isOutside = /\bcancun\b|\btulum\b|\bcobá\b|\bcoba\b|\bfелipe\b|\bfelipe\s+carrillo\b|\bchetumal\b|\bholbox\b|\bisla\s+mujeres\b|\bpuerto\s+morelos\b|\bvalladolid\b|\bmerida\b|\bmexico\b|\bcdmx\b|\bmonterrey\b|\bguadalajara\b|\botro\s+estado\b|\botra\s+ciudad\b|\bfuera\s+de\s+playa\b|\bfuera\s+de\s+la\s+ciudad\b|\bquintana\s+roo\b|\bq\.?\s*roo\b|\botro\s+municipio\b|\benvio\b|\benvío\b|\bentrega\s+a\b/.test(n);
+    const isPlaya = /\bplaya\b|\bplaya\s+del\s+carmen\b|\ben\s+tienda\b|\bpaso\s+a\s+tienda\b|\bvoy\s+a\s+tienda\b|\brec[ou]jo\b|\bpaso\s+por\b/.test(n);
+    return isOutside && !isPlaya;
+}
+
+function isPickupInStore(text) {
+    const n = normalizeText(text);
+    return /\ben\s+tienda\b|\bpaso\s+a\s+tienda\b|\bvoy\s+a\s+tienda\b|\brec[ou]jo\b|\bpaso\s+por\b|\bpaso\s+yo\b|\bvoy\s+yo\b|\bpick\s*up\b|\brecoger\b/.test(n);
+}
+
+function getPaymentReply(text) {
+    if (isPickupInStore(text)) {
+        return 'En tienda aceptamos efectivo, tarjeta de débito/crédito y transferencia bancaria.';
+    }
+    if (isDeliveryOutsidePlaya(text)) {
+        return 'Para envíos fuera de Playa del Carmen el pago es únicamente por transferencia bancaria.';
+    }
+    // Pregunta genérica sin contexto de entrega
+    return 'En tienda aceptamos efectivo, tarjeta y transferencia. Para envíos fuera de Playa del Carmen el pago es por transferencia únicamente.';
+}
+
 // ─── Prompt del sistema ───────────────────────────────────────────────────────
 
 function getSystemPrompt() {
@@ -122,17 +151,25 @@ function getSystemPrompt() {
 ## PRODUCTOS QUE VENDEMOS
 Andamios, puntales, malacates, polipastos, compresores, generadores, vibradores de concreto, cortadoras de plasma, herramienta y materiales para construcción.
 
+## FORMAS DE PAGO
+- Compra en tienda: efectivo, tarjeta de débito/crédito o transferencia bancaria.
+- Envío fuera de Playa del Carmen (cualquier municipio o ciudad): transferencia bancaria únicamente.
+- Si el cliente pregunta por formas de pago y ya mencionó que viene a tienda, indica las tres opciones.
+- Si ya mencionó envío fuera de Playa, indica solo transferencia.
+- Si no hay contexto claro, menciona ambas políticas en una sola respuesta.
+
 ## REGLAS DE RESPUESTA
 1. NUNCA menciones precios exactos; si preguntan, indícales que la cotización se hace según el equipo y cantidad, e invítalos a solicitarla.
-2. Cuando el cliente pregunte por disponibilidad de un producto, CONFIRMA que lo manejas (si está en tu lista) y PREGUNTA cuántas piezas necesita y para cuándo, para orientar mejor.
-3. Si el cliente solicita una cotización, pide: (a) qué equipo necesita, (b) cantidad, (c) si es para entrega o recoge en tienda. Con esa info el equipo le prepara la cotización.
-4. Si preguntan por ubicación u horarios, da la información completa de una sola vez.
-5. Si el mensaje es ambiguo, haz UNA sola pregunta de aclaración breve y directa.
-6. No des recomendaciones técnicas detalladas (eso lo maneja el equipo en piso).
-7. No repitas el saludo en cada mensaje; ve directo a la información.
-8. Nunca te identifiques como bot, IA o asistente virtual.
-9. No menciones marcas específicas de equipos en respuestas generales.
-10. Cierra siempre con una invitación a continuar la conversación o a acercarse a la tienda.
+2. NUNCA confirmes disponibilidad de ningún producto. Cuando pregunten si tienes algo, responde que revisarás y confirmarás. Ejemplos correctos: "Déjame revisar y te confirmo si tenemos existencia." "En cuanto verifique te aviso." NUNCA digas "sí tenemos", "sí manejamos", "sí contamos con".
+3. NUNCA menciones tiempos de entrega. Eso lo confirma el equipo después de revisar.
+4. Si el cliente solicita una cotización, pide: (a) qué equipo necesita, (b) cantidad, (c) si es para entrega o recoge en tienda. Con esa info el equipo le prepara la cotización.
+5. Si preguntan por ubicación u horarios, da la información completa de una sola vez.
+6. Si el mensaje es ambiguo, haz UNA sola pregunta de aclaración breve y directa.
+7. No des recomendaciones técnicas detalladas (eso lo maneja el equipo en piso).
+8. No repitas el saludo en cada mensaje; ve directo a la información.
+9. Nunca te identifiques como bot, IA o asistente virtual.
+10. No menciones marcas específicas de equipos en respuestas generales.
+11. Cierra siempre con una invitación a continuar la conversación o a acercarse a la tienda.
 
 ## TONO Y FORMATO
 - Lenguaje: español neutro, amable y directo, como un vendedor real de WhatsApp
@@ -234,6 +271,11 @@ async function queryAI({ text, history = [], phoneNumber = '' }) {
             return { reply: getLocationReply(), provider: 'policy:location' };
         }
 
+        // 5. Forma de pago → respuesta según contexto de entrega
+        if (isPaymentRequest(text)) {
+            return { reply: getPaymentReply(text), provider: 'policy:payment' };
+        }
+
         // 5. Promociones del catálogo local
         try {
             const promotionReply = await getPromotionReply(text);
@@ -281,4 +323,4 @@ async function queryAI({ text, history = [], phoneNumber = '' }) {
     }
 }
 
-module.exports = { queryAI, isFarewellMessage };
+module.exports = { queryAI, isFarewellMessage, isPaymentRequest, isPickupInStore, isDeliveryOutsidePlaya };

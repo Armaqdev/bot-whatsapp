@@ -455,10 +455,11 @@ async function getCatalogReply(userText) {
     const productLabel = requestedProduct;
 
     if (!productInfo) {
-        return `Revisando la lista actual, no me aparece ${productLabel} como equipo en venta. Si quieres, te confirmo opciones similares que si manejamos.`;
+        return `Déjame verificar si tenemos ${productLabel} disponible y te confirmo.`;
     }
 
-    return `Si, manejamos ${productLabel} en venta. Si gustas, te confirmo existencias para tu solicitud.`;
+    // Fix 3: no confirmar disponibilidad, solo registrar interés
+    return `Déjame revisar existencia de ${productLabel} y te confirmo. ¿Cuántas piezas necesitas y la entrega es en Playa del Carmen o en otra ciudad?`;
 }
 
 async function getPromotionContext(userText) {
@@ -474,16 +475,11 @@ async function getPromotionReply(userText) {
     if (!wantsPromo) return null;
 
     if (!requestedProduct) {
-        return 'Si tenemos promociones vigentes este mes. Dime que equipo te interesa y te confirmo si lo manejamos en venta.';
+        return 'Déjame revisar qué tenemos disponible y te confirmo precios. ¿Qué equipo te interesa?';
     }
 
-    const catalog = await loadCatalog();
-    const productInfo = catalog.byProduct[requestedProduct];
-    if (!productInfo) {
-        return `En este momento no veo ${requestedProduct} en la lista de venta actual. Si quieres, te confirmo alternativas disponibles.`;
-    }
-
-    return `Si, manejamos ${requestedProduct} en venta y contamos con promociones vigentes. Si quieres, te confirmo existencias y opciones disponibles.`;
+    // Fix 3: no confirmar disponibilidad ni promociones, solo levantar el interés
+    return `Déjame verificar existencia y precio de ${requestedProduct} y te confirmo. ¿Cuántas piezas necesitas?`;
 }
 
 module.exports = {

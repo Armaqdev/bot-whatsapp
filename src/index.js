@@ -23,6 +23,10 @@ const OWNER_PHONE = normalizePhoneNumber(process.env.OWNER_PHONE || '9848018317'
 const OWNER_CHAT_ID = process.env.OWNER_CHAT_ID || '';
 const pendingQuotes = new Map();
 const leadStates = new Map();
+// Debounce: acumula mensajes del mismo cliente antes de procesar
+const messageBuffers = new Map();   // phoneNumber → [{ message, text }]
+const debounceTimers = new Map();   // phoneNumber → timeoutId
+const DEBOUNCE_MS = Number(process.env.DEBOUNCE_MS || 3500); // 3.5 segundos de espera
 let client = null;
 
 const PRODUCT_KEYWORDS = [
@@ -350,13 +354,17 @@ async function handleQuoteRequest(targetClient, message, phoneNumber, incomingTe
                 createdAt: Date.now()
             });
             const ownerChatId = await resolveOwnerChatId(targetClient);
+            // Incluir cantidad y destino en la notificación al asesor
             const ownerInstruction = [
                 'Nueva solicitud de cotizacion.',
                 `Folio: ${quoteId}`,
                 `Cliente: ${phoneNumber}`,
+                `Nombre: ${leadStates.get(phoneNumber)?.name || 'No capturado'}`,
                 `Tipo: ${isFormal ? 'Cotizacion formal PDF' : 'Precio y tiempo de entrega'}`,
                 `Equipo solicitado: ${prod}`,
-                `Mensaje: ${incomingText}`,
+                `Cantidad: ${options.quantity || 'No especificada'}`,
+                `Destino de entrega: ${options.deliveryAddress || 'No especificado'}`,
+                `Mensaje del cliente: ${incomingText}`,
                 '',
                 isFormal
                     ? `Responde enviando PDF con el folio en el texto/caption: ${quoteId}`
@@ -374,15 +382,13 @@ async function handleQuoteRequest(targetClient, message, phoneNumber, incomingTe
             if (!ownerChatId) {
                 console.warn('⚠️  OWNER_PHONE/OWNER_CHAT_ID no configurado. No se pudo notificar al asesor.');
             }
-            // Usar historial y queryAI para la respuesta
-            const history = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
-            const aiResult = await queryAI({
-                text: incomingText,
-                history,
-                phoneNumber
-            });
-            await message.reply(aiResult.reply);
-            await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, isFormal ? 'quote:formal-pending' : 'quote:pending');
+            // Fix 3: NO confirmar disponibilidad. Solo avisar que se tomó nota.
+            // El asesor confirmará existencia y tiempo de entrega cuando responda.
+            const clientConfirm = isFormal
+                ? 'Listo, ya registré tu solicitud. En breve te enviamos la cotización.'
+                : 'Listo, ya tomé nota. En cuanto tenga el precio y tiempo de entrega te confirmo.';
+            await message.reply(clientConfirm);
+            await saveConversationMessage(phoneNumber, 'assistant', clientConfirm, isFormal ? 'quote:formal-pending' : 'quote:pending');
         }
         // Registrar una cotización pendiente por cada producto detectado
         for (const prod of requestedProducts) {
@@ -660,7 +666,8 @@ async function handleOwnerMessage(targetClient, message, incomingText, ownerPhon
             return;
         }
 
-        const caption = parsed.quoteText || `Cotizacion formal ${parsed.quoteId}`;
+        // Solo se envía al cliente el caption del asesor, sin el folio interno
+        const caption = parsed.quoteText || 'Tu cotización formal adjunta.';
         // Obtener chatId válido para media
         let mediaChatId = pendingWithMedia.clientChatId;
         try {
@@ -694,7 +701,8 @@ async function handleOwnerMessage(targetClient, message, incomingText, ownerPhon
         return;
     }
 
-    const customerText = `Sobre tu solicitud ${parsed.quoteId}: ${parsed.quoteText}`;
+    // Solo se envía al cliente el texto que escribió el asesor, sin folio ni referencias internas
+    const customerText = parsed.quoteText;
     // Obtener chatId válido para respuesta
     let replyChatId = pending.clientChatId;
     try {
@@ -814,102 +822,218 @@ function registerEventListeners(targetClient) {
 
         const phoneNumber = normalizePhoneNumber(message.from);
 
-        try {
-            console.log('  ↳ Procesando...');
-
-            if (isOwnerPhone(phoneNumber)) {
+        // ── Mensajes del asesor: sin debounce, procesar inmediato ──
+        if (isOwnerPhone(phoneNumber)) {
+            try {
                 await handleOwnerMessage(targetClient, message, incomingText, phoneNumber);
                 console.log('  ↳ ✅ Mensaje de asesor procesado');
-                return;
+            } catch (error) {
+                console.error('  ↳ ❌ Error en mensaje de asesor:', error.message);
             }
-
-            await saveConversationMessage(phoneNumber, 'user', incomingText, 'whatsapp');
-            const leadState = getLeadState(phoneNumber);
-            await ensureLeadStateFromDb(phoneNumber, leadState);
-
-            // Detectar despedida y marcar conversación como cerrada
-            const { isFarewellMessage } = require('./ai');
-            if (isFarewellMessage(incomingText)) {
-                leadState.closed = true;
-                const sameDayHistory = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
-                const aiResult = await queryAI({
-                    text: incomingText,
-                    history: sameDayHistory,
-                    phoneNumber
-                });
-                await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'farewell');
-                await message.reply(aiResult.reply);
-                console.log('  ↳ 🚪 Conversación marcada como cerrada por despedida');
-                return;
-            }
-
-            // Si la conversación está cerrada, solo reabrir si hay intención de cotización/producto
-            if (leadState.closed) {
-                const shouldReopen = isFormalQuoteRequest(incomingText) || isQuoteRequest(incomingText) || isProductIntent(incomingText);
-                if (!shouldReopen) {
-                    console.log('  ↳ 🚪 Conversación cerrada, ignorando mensaje no relevante');
-                    return;
-                }
-                leadState.closed = false; // Reabrir conversación
-                console.log('  ↳ 🔓 Conversación reabierta por nueva solicitud');
-            }
-
-            // FLUJO CORREGIDO: Solo notificar al operador si ya hay producto y datos mínimos
-            const isQuote = isFormalQuoteRequest(incomingText) || isQuoteRequest(incomingText);
-            const isProduct = isProductIntent(incomingText);
-            const sameDayHistory = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
-            let requestedProduct = detectRequestedProduct(incomingText) || detectRequestedProductFromHistory(sameDayHistory);
-
-            // Si el cliente pide cotización pero NO hay producto, primero preguntar por el producto
-            if (isQuote && !requestedProduct) {
-                const aiResult = await queryAI({
-                    text: '¿Qué equipo necesitas cotizar?',
-                    history: sameDayHistory,
-                    phoneNumber
-                });
-                await message.reply(aiResult.reply);
-                await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-product');
-                return;
-            }
-
-            // Si el cliente menciona producto, solo pedir nombre si no lo tenemos.
-            // Teléfono y correo son opcionales para no bloquear la conversación.
-            if ((isQuote || isProduct) && requestedProduct) {
-                if (!leadState.name) {
-                    const aiResult = await queryAI({
-                        text: 'Por favor dime tu nombre para registrar tu solicitud',
-                        history: sameDayHistory,
-                        phoneNumber
-                    });
-                    await message.reply(aiResult.reply);
-                    await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-name');
-                    return;
-                }
-                // Con nombre es suficiente: notificar al operador y avanzar
-                await handleQuoteRequest(targetClient, message, phoneNumber, incomingText, {
-                    isFormal: isFormalQuoteRequest(incomingText),
-                    requestedProduct
-                });
-                console.log('  ↳ ✅ Solicitud registrada para seguimiento');
-                return;
-            }
-
-            // --- BUG 2 y 3: Usar sameDayHistory y asegurar orden correcto ---
-            const result = await queryAI({
-                text: incomingText,
-                history: sameDayHistory,
-                phoneNumber
-            });
-
-            console.log(`🤖 [AI OUT] provider=${result.provider} reply=${String(result.reply || '').substring(0, 220)}`);
-
-            await message.reply(result.reply);
-            await saveConversationMessage(phoneNumber, 'assistant', result.reply, result.provider);
-            console.log('  ↳ ✅ Respuesta enviada');
-        } catch (error) {
-            console.error('  ↳ ❌ Error:', error.message);
+            return;
         }
+
+        // ── Debounce para clientes: acumular mensajes y esperar ──
+        if (!messageBuffers.has(phoneNumber)) {
+            messageBuffers.set(phoneNumber, []);
+        }
+        messageBuffers.get(phoneNumber).push({ message, text: incomingText });
+        console.log(`  ↳ Mensaje en buffer (${messageBuffers.get(phoneNumber).length} acumulados). Esperando ${DEBOUNCE_MS}ms...`);
+
+        // Cancelar timer anterior si existía
+        if (debounceTimers.has(phoneNumber)) {
+            clearTimeout(debounceTimers.get(phoneNumber));
+        }
+
+        // Iniciar nuevo timer
+        const timer = setTimeout(async () => {
+            debounceTimers.delete(phoneNumber);
+            const buffered = messageBuffers.get(phoneNumber) || [];
+            messageBuffers.delete(phoneNumber);
+
+            if (buffered.length === 0) return;
+
+            // Tomar el último mensaje como referencia para el reply
+            const lastMessage = buffered[buffered.length - 1].message;
+            // Unir todos los textos en uno solo para procesar con contexto completo
+            const combinedText = buffered.length === 1
+                ? buffered[0].text
+                : buffered.map(b => b.text).join('\n');
+
+            if (buffered.length > 1) {
+                console.log(`  ↳ Procesando ${buffered.length} mensajes combinados de ${phoneNumber}`);
+            }
+
+            try {
+                await processClientMessage(targetClient, lastMessage, combinedText, phoneNumber);
+            } catch (error) {
+                console.error('  ↳ ❌ Error procesando mensajes combinados:', error.message);
+            }
+        }, DEBOUNCE_MS);
+
+        debounceTimers.set(phoneNumber, timer);
     });
+
+
+// ── Helpers para extraer datos del historial completo del día ─────────────────
+
+function extractQuantityFromHistory(history) {
+    // Busca un número de piezas mencionado en cualquier mensaje del cliente ese día
+    for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].role !== 'user') continue;
+        const m = history[i].content.match(/\b(\d+)\s*(piezas?|pzas?|unidades?|equipos?|juegos?)\b/i);
+        if (m) return m[0].trim();
+        // También acepta solo número si es respuesta a "¿cuántas piezas?"
+        const solo = history[i].content.match(/^\s*(\d{1,4})\s*$/);
+        if (solo) return solo[1].trim();
+    }
+    return null;
+}
+
+function extractPickupFromHistory(history) {
+    // Detecta si en algún mensaje el cliente indicó que pasa a recoger en tienda
+    const pickupRe = /\ben\s+tienda\b|\bpaso\s+(a|por)\b|\bvoy\s+(a|yo)\b|\brec[ou]jo\b|\bpick\s*up\b|\brecoger\b|\bpaso\s+yo\b|\bvoy\s+yo\b|\bme\s+lo\s+llevo\b|\bpaso\s+a\s+recoger\b/i;
+    return history.some(h => h.role === 'user' && pickupRe.test(h.content));
+}
+
+function extractDestinationFromHistory(history) {
+    // Detecta ciudad/destino de entrega mencionado por el cliente
+    const deliveryRe = /\benvi[oó]\b|\bentrega\b|\bmandar\b|\bllev[ae]r\b/i;
+    for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].role !== 'user') continue;
+        if (deliveryRe.test(history[i].content)) {
+            return history[i].content.trim().slice(0, 80);
+        }
+    }
+    return null;
+}
+
+// ── Función principal de procesamiento de mensajes de clientes ────────────────
+async function processClientMessage(targetClient, message, incomingText, phoneNumber) {
+    console.log('  ↳ Procesando...');
+
+    await saveConversationMessage(phoneNumber, 'user', incomingText, 'whatsapp');
+    const leadState = getLeadState(phoneNumber);
+    await ensureLeadStateFromDb(phoneNumber, leadState);
+
+    const { isFarewellMessage } = require('./ai');
+
+    if (isFarewellMessage(incomingText)) {
+        leadState.closed = true;
+        const sameDayHistory = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
+        const aiResult = await queryAI({ text: incomingText, history: sameDayHistory, phoneNumber });
+        await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'farewell');
+        await message.reply(aiResult.reply);
+        console.log('  ↳ 🚪 Conversación marcada como cerrada por despedida');
+        return;
+    }
+
+    if (leadState.closed) {
+        const shouldReopen = isFormalQuoteRequest(incomingText) || isQuoteRequest(incomingText) || isProductIntent(incomingText);
+        if (!shouldReopen) {
+            console.log('  ↳ 🚪 Conversación cerrada, ignorando mensaje no relevante');
+            return;
+        }
+        leadState.closed = false;
+        console.log('  ↳ 🔓 Conversación reabierta por nueva solicitud');
+    }
+
+    const isQuote = isFormalQuoteRequest(incomingText) || isQuoteRequest(incomingText);
+    const isProduct = isProductIntent(incomingText);
+    const sameDayHistory = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
+    let requestedProduct = detectRequestedProduct(incomingText) || detectRequestedProductFromHistory(sameDayHistory);
+
+    if (isQuote && !requestedProduct) {
+        const aiResult = await queryAI({ text: '¿Qué equipo necesitas cotizar?', history: sameDayHistory, phoneNumber });
+        await message.reply(aiResult.reply);
+        await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-product');
+        return;
+    }
+
+    if ((isQuote || isProduct) && requestedProduct) {
+
+        // ── Nombre ────────────────────────────────────────────────────────────
+        if (!leadState.name) {
+            const aiResult = await queryAI({ text: 'Por favor dime tu nombre para registrar tu solicitud', history: sameDayHistory, phoneNumber });
+            await message.reply(aiResult.reply);
+            await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'lead:ask-name');
+            leadState.awaitingName = true;
+            return;
+        }
+        if (leadState.awaitingName) {
+            const detectedName = extractNameFromText(incomingText);
+            if (detectedName) {
+                leadState.name = detectedName;
+                leadState.awaitingName = false;
+                await upsertConversationLeadData(phoneNumber, { name: detectedName });
+            }
+        }
+
+        // ── Cantidad: buscar en historial antes de preguntar ──────────────────
+        if (!leadState.quantity) {
+            // 1. Buscar en el historial completo del día
+            const qtyFromHistory = extractQuantityFromHistory([...sameDayHistory, { role: 'user', content: incomingText }]);
+            if (qtyFromHistory) {
+                leadState.quantity = qtyFromHistory;
+                leadState.awaitingQuantity = false;
+                console.log(`  ↳ Cantidad detectada del historial: ${qtyFromHistory}`);
+            } else if (leadState.awaitingQuantity) {
+                // El cliente está respondiendo la pregunta de cantidad
+                const qtyMatch = incomingText.match(/\b(\d+)\s*(piezas?|pzas?|unidades?|equipos?|juegos?)?/i);
+                leadState.quantity = qtyMatch ? qtyMatch[0].trim() : incomingText.trim().slice(0, 40);
+                leadState.awaitingQuantity = false;
+            } else {
+                // No hay cantidad en ningún lado: preguntar UNA sola vez
+                const prodLabel = Array.isArray(requestedProduct) ? requestedProduct[0] : requestedProduct;
+                const reply = `¿Cuántas piezas de ${prodLabel} necesitas?`;
+                await message.reply(reply);
+                await saveConversationMessage(phoneNumber, 'assistant', reply, 'lead:ask-quantity');
+                leadState.awaitingQuantity = true;
+                return;
+            }
+        }
+
+        // ── Destino: si el cliente dijo que pasa a tienda, no preguntar ───────
+        if (!leadState.deliveryAddress) {
+            const allMessages = [...sameDayHistory, { role: 'user', content: incomingText }];
+
+            // ¿Ya dijo que viene a tienda en algún mensaje?
+            if (extractPickupFromHistory(allMessages)) {
+                leadState.deliveryAddress = 'recoge en tienda';
+                leadState.awaitingDestination = false;
+                await upsertConversationLeadData(phoneNumber, { deliveryAddress: 'recoge en tienda' });
+                console.log('  ↳ Destino: recoge en tienda (detectado del historial)');
+            } else if (leadState.awaitingDestination) {
+                leadState.deliveryAddress = incomingText.trim().slice(0, 80);
+                leadState.awaitingDestination = false;
+                await upsertConversationLeadData(phoneNumber, { deliveryAddress: leadState.deliveryAddress });
+            } else {
+                // No hay info de destino: preguntar UNA sola vez
+                const reply = '¿Pasas a recoger en tienda o necesitas envío?';
+                await message.reply(reply);
+                await saveConversationMessage(phoneNumber, 'assistant', reply, 'lead:ask-destination');
+                leadState.awaitingDestination = true;
+                return;
+            }
+        }
+
+        // ── Tenemos todo: notificar al asesor ─────────────────────────────────
+        await handleQuoteRequest(targetClient, message, phoneNumber, incomingText, {
+            isFormal: isFormalQuoteRequest(incomingText),
+            requestedProduct,
+            quantity: leadState.quantity,
+            deliveryAddress: leadState.deliveryAddress
+        });
+        console.log('  ↳ ✅ Solicitud registrada para seguimiento');
+        return;
+    }
+
+    const result = await queryAI({ text: incomingText, history: sameDayHistory, phoneNumber });
+    console.log(`🤖 [AI OUT] provider=${result.provider} reply=${String(result.reply || '').substring(0, 220)}`);
+    await message.reply(result.reply);
+    await saveConversationMessage(phoneNumber, 'assistant', result.reply, result.provider);
+    console.log('  ↳ ✅ Respuesta enviada');
+}
 
 
     targetClient.on('disconnected', (reason) => {
