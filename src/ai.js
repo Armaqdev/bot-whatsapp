@@ -170,6 +170,7 @@ Andamios, puntales, malacates, polipastos, compresores, generadores, vibradores 
 9. Nunca te identifiques como bot, IA o asistente virtual.
 10. No menciones marcas específicas de equipos en respuestas generales.
 11. Cierra siempre con una invitación a continuar la conversación o a acercarse a la tienda.
+12. Si el cliente expresa molestia por preguntas repetidas ("ya te dije", "ya te mencioné", "cuántas veces"), discúlpate brevemente y confirma lo que él indicó sin volver a preguntar. Ejemplo: "Disculpa la confusión, ya quedó registrado."
 
 ## TONO Y FORMATO
 - Lenguaje: español neutro, amable y directo, como un vendedor real de WhatsApp
@@ -185,8 +186,71 @@ function toOpenAIHistory(history) {
     if (!Array.isArray(history)) return [];
     return history
         .filter((e) => e && (e.role === 'user' || e.role === 'assistant') && e.content)
-        .slice(-10)
+        .slice(-14)
         .map((e) => ({ role: e.role, content: e.content }));
+}
+
+/**
+ * Construye un bloque de contexto que resume todo lo que ya se sabe del cliente
+ * en la conversación del día. La IA lo recibe como system message para no
+ * repetir preguntas ni perder el hilo.
+ */
+function buildConversationContext(history) {
+    if (!Array.isArray(history) || history.length === 0) {
+        return 'Conversación nueva. No hay historial previo del día.';
+    }
+
+    const lines = ['== Resumen de la conversación de hoy =='];
+
+    // Producto mencionado
+    const productRe = /andamio|puntal|malacate|polipasto|compresor|generador|vibrador|cortadora|revolvedora|planta\s+de\s+luz/i;
+    const productMsgs = history.filter(h => h.role === 'user' && productRe.test(h.content));
+    if (productMsgs.length > 0) {
+        lines.push(`- Producto mencionado: "${productMsgs[productMsgs.length - 1].content.slice(0, 80)}"`);
+    }
+
+    // Cantidad mencionada
+    const qtyRe = /\b(\d+)\s*(piezas?|pzas?|unidades?|andamios?|equipos?)?|\b(?:que|son|quiero|necesito|dije|dicho)\s+(\d+)\b/i;
+    for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].role !== 'user') continue;
+        const m = history[i].content.match(qtyRe);
+        if (m) {
+            lines.push(`- Cantidad indicada por el cliente: ${m[1] || m[3]}`);
+            break;
+        }
+    }
+
+    // Destino / recoge en tienda
+    const pickupRe = /\ben\s+tienda\b|\bpaso\s+(a|por)\b|\bvoy\s+(a|yo)\b|\brec[ou]jo\b|\bpaso\s+yo\b|\bpaso\s+por\b/i;
+    const pickupMsg = history.find(h => h.role === 'user' && pickupRe.test(h.content));
+    if (pickupMsg) {
+        lines.push('- Entrega: el cliente indicó que pasa a recoger en tienda. NO preguntar destino.');
+    } else {
+        const destRe = /cancun|tulum|cozumel|chetumal|holbox|puerto\s+morelos|otra\s+ciudad|fuera\s+de\s+playa|envio|envío/i;
+        const destMsg = history.find(h => h.role === 'user' && destRe.test(h.content));
+        if (destMsg) {
+            lines.push(`- Entrega: cliente mencionó envío o ciudad: "${destMsg.content.slice(0, 60)}"`);
+        }
+    }
+
+    // Nombre capturado
+    const nameMsgs = history.filter(h => h.role === 'user');
+    for (const msg of nameMsgs) {
+        const nameMatch = msg.content.match(/(?:mi nombre es|me llamo|soy)\s+([A-ZÁÉÍÓÚÑa-záéíóúñ'\- ]{2,30})/i);
+        if (nameMatch) {
+            lines.push(`- Nombre del cliente: ${nameMatch[1].trim()}`);
+            break;
+        }
+    }
+
+    // Molestia por preguntas repetidas
+    const frustRe = /ya\s+te\s+(dije|mencion[eé]|indic[ée]|dij)|cu[aá]ntas\s+veces|ya\s+lo\s+dije|te\s+lo\s+dije/i;
+    if (history.some(h => h.role === 'user' && frustRe.test(h.content))) {
+        lines.push('- IMPORTANTE: el cliente ya expresó molestia por preguntas repetidas. NO volver a preguntar lo que ya respondió.');
+    }
+
+    lines.push('== Fin del resumen. Responde con base en este contexto. ==');
+    return lines.join('\n');
 }
 
 function getFallbackResponse() {
@@ -218,6 +282,7 @@ async function tryOpenAI(text, history, phoneNumber) {
     const messages = [
         { role: 'system', content: getSystemPrompt() },
         { role: 'system', content: `Teléfono del cliente: ${phoneNumber || 'desconocido'}. Solo para contexto interno.` },
+        { role: 'system', content: buildConversationContext(history) },
         { role: 'system', content: catalogContext || 'Sin contexto adicional de catálogo para este mensaje.' },
         { role: 'system', content: promotionContext || 'Sin promociones activas para este mensaje.' },
         ...toOpenAIHistory(history),
@@ -323,4 +388,4 @@ async function queryAI({ text, history = [], phoneNumber = '' }) {
     }
 }
 
-module.exports = { queryAI, isFarewellMessage, isPaymentRequest, isPickupInStore, isDeliveryOutsidePlaya };
+module.exports = { queryAI, isFarewellMessage, isPaymentRequest, isPickupInStore, isDeliveryOutsidePlaya, isLocationOrHoursRequest };

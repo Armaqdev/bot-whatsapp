@@ -224,16 +224,33 @@ function getLeadState(phoneNumber) {
     return leadStates.get(phoneNumber);
 }
 
-async function ensureLeadStateFromDb(phoneNumber, leadState) {
+async function ensureLeadStateFromDb(phoneNumber, leadState, todayHistory = null) {
     if (leadState.profileLoaded) {
         return;
     }
 
     const profile = await getConversationLeadData(phoneNumber);
     if (profile) {
-        leadState.name = profile.name || leadState.name;
-        leadState.contactPhone = profile.contactPhone || leadState.contactPhone;
-        leadState.email = profile.email || leadState.email;
+        leadState.name            = profile.name            || leadState.name;
+        leadState.contactPhone    = profile.contactPhone    || leadState.contactPhone;
+        leadState.email           = profile.email           || leadState.email;
+        leadState.deliveryAddress = profile.deliveryAddress || leadState.deliveryAddress;
+    }
+
+    // Recuperar quantity y destino del historial del dia (reusar el ya cargado si viene)
+    if (!leadState.quantity || !leadState.deliveryAddress) {
+        const history = todayHistory || await getRecentConversationHistory(phoneNumber, 40, { sameDayOnly: true });
+        if (!leadState.quantity) {
+            const qtyFound = extractQuantityFromHistory(history);
+            if (qtyFound) {
+                leadState.quantity = qtyFound;
+                console.log('  ↳ quantity recuperada del historial: ' + qtyFound);
+            }
+        }
+        if (!leadState.deliveryAddress && extractPickupFromHistory(history)) {
+            leadState.deliveryAddress = 'recoge en tienda';
+            console.log('  ↳ destino recuperado del historial: recoge en tienda');
+        }
     }
 
     leadState.profileLoaded = true;
@@ -878,14 +895,21 @@ function registerEventListeners(targetClient) {
 // ── Helpers para extraer datos del historial completo del día ─────────────────
 
 function extractQuantityFromHistory(history) {
-    // Busca un número de piezas mencionado en cualquier mensaje del cliente ese día
     for (let i = history.length - 1; i >= 0; i--) {
         if (history[i].role !== 'user') continue;
-        const m = history[i].content.match(/\b(\d+)\s*(piezas?|pzas?|unidades?|equipos?|juegos?)\b/i);
-        if (m) return m[0].trim();
-        // También acepta solo número si es respuesta a "¿cuántas piezas?"
-        const solo = history[i].content.match(/^\s*(\d{1,4})\s*$/);
-        if (solo) return solo[1].trim();
+        const txt = history[i].content;
+
+        // P1: número + unidad de equipo ("10 andamios", "5 piezas")
+        const withUnit = txt.match(/\b(\d+)\s*(piezas?|pzas?|unidades?|equipos?|juegos?|andamios?|puntales?|vibradores?|compresores?|generadores?|revolvedoras?|polipastos?|malacates?|cortadoras?)\b/i);
+        if (withUnit) return withUnit[1].trim();
+
+        // P2: keyword antes del número ("son 10", "que 10", "dije 10", "necesito 10", "quiero 10")
+        const afterKw = txt.match(/(?:que|son|quiero|necesito|pido|solicito|dije|dicho|dijimos|mencion[eé]|eran|ser[aá]n)\s+(\d{1,4})\b/i);
+        if (afterKw) return afterKw[1].trim();
+
+        // P3: número solo o al inicio del mensaje ("10", "10 para mañana")
+        const soloNum = txt.match(/^\s*(\d{1,4})(?:\s|$)/);
+        if (soloNum) return soloNum[1].trim();
     }
     return null;
 }
@@ -912,15 +936,19 @@ function extractDestinationFromHistory(history) {
 async function processClientMessage(targetClient, message, incomingText, phoneNumber) {
     console.log('  ↳ Procesando...');
 
+    // Cargar historial del día ANTES de cualquier decisión
+    const sameDayHistory = await getRecentConversationHistory(phoneNumber, 40, { sameDayOnly: true });
+    // Historial + mensaje actual para todas las detecciones de patrones
+    const fullDayContext = [...sameDayHistory, { role: 'user', content: incomingText }];
+
     await saveConversationMessage(phoneNumber, 'user', incomingText, 'whatsapp');
     const leadState = getLeadState(phoneNumber);
-    await ensureLeadStateFromDb(phoneNumber, leadState);
+    await ensureLeadStateFromDb(phoneNumber, leadState, sameDayHistory);
 
     const { isFarewellMessage } = require('./ai');
 
     if (isFarewellMessage(incomingText)) {
         leadState.closed = true;
-        const sameDayHistory = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
         const aiResult = await queryAI({ text: incomingText, history: sameDayHistory, phoneNumber });
         await saveConversationMessage(phoneNumber, 'assistant', aiResult.reply, 'farewell');
         await message.reply(aiResult.reply);
@@ -940,8 +968,19 @@ async function processClientMessage(targetClient, message, incomingText, phoneNu
 
     const isQuote = isFormalQuoteRequest(incomingText) || isQuoteRequest(incomingText);
     const isProduct = isProductIntent(incomingText);
-    const sameDayHistory = await getRecentConversationHistory(phoneNumber, 30, { sameDayOnly: true });
     let requestedProduct = detectRequestedProduct(incomingText) || detectRequestedProductFromHistory(sameDayHistory);
+
+    // ── Si el mensaje es solo una pregunta de horario/ubicación/pago, responder directo ──
+    // Aunque mencione un producto de pasada ("a qué hora puedo pasar por los andamios"),
+    // el cliente solo quiere saber el horario — no iniciar flujo de cotización.
+    const { isLocationOrHoursRequest, isPaymentRequest } = require('./ai');
+    if (isLocationOrHoursRequest(incomingText) || isPaymentRequest(incomingText)) {
+        const result = await queryAI({ text: incomingText, history: sameDayHistory, phoneNumber });
+        await message.reply(result.reply);
+        await saveConversationMessage(phoneNumber, 'assistant', result.reply, result.provider);
+        console.log('  ↳ ✅ Respuesta de horario/ubicación/pago enviada');
+        return;
+    }
 
     if (isQuote && !requestedProduct) {
         const aiResult = await queryAI({ text: '¿Qué equipo necesitas cotizar?', history: sameDayHistory, phoneNumber });
@@ -972,10 +1011,12 @@ async function processClientMessage(targetClient, message, incomingText, phoneNu
         // ── Cantidad: buscar en historial antes de preguntar ──────────────────
         if (!leadState.quantity) {
             // 1. Buscar en el historial completo del día
-            const qtyFromHistory = extractQuantityFromHistory([...sameDayHistory, { role: 'user', content: incomingText }]);
+            const qtyFromHistory = extractQuantityFromHistory(fullDayContext);
             if (qtyFromHistory) {
                 leadState.quantity = qtyFromHistory;
                 leadState.awaitingQuantity = false;
+                // Persistir en DB para que sobreviva reinicios del bot
+                await upsertConversationLeadData(phoneNumber, { desiredProduct: Array.isArray(requestedProduct) ? requestedProduct.join(', ') : requestedProduct });
                 console.log(`  ↳ Cantidad detectada del historial: ${qtyFromHistory}`);
             } else if (leadState.awaitingQuantity) {
                 // El cliente está respondiendo la pregunta de cantidad
@@ -995,7 +1036,7 @@ async function processClientMessage(targetClient, message, incomingText, phoneNu
 
         // ── Destino: si el cliente dijo que pasa a tienda, no preguntar ───────
         if (!leadState.deliveryAddress) {
-            const allMessages = [...sameDayHistory, { role: 'user', content: incomingText }];
+            const allMessages = fullDayContext;
 
             // ¿Ya dijo que viene a tienda en algún mensaje?
             if (extractPickupFromHistory(allMessages)) {
